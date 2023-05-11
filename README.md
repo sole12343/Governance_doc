@@ -3,8 +3,8 @@
 ## 一、整体框架
 ### 1. CheckPoint快照
 通过ERC20Votes合约
+![CheckPoint测试流程](png\output.png "区块链")
 
-[图片]
 
 ## 二、代码详解
 
