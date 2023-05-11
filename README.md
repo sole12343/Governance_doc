@@ -24,7 +24,7 @@ DAO中修改合约参数或升级等功能，是不能人为干预，必须经�
 ![不标准的代币处理](https://github.com/sole12343/Governance_doc/blob/main/png/4.png )
 
 ## 二、代码详解
-
+见代码详解文件夹的markdown
 
 ## 三、治理合约js测试案例
 
