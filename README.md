@@ -33,4 +33,4 @@ tkc-Governor是测试案例，里面包括先部署erc20合约，再将此erc20�
 - COMP has been deployed to 0xc00e94cb662c3520282e6f5717214004a7f26888
 - Governance has been deployed to 0xc0dA01a04C3f3E0be433606045bB7017A7323E38
 - The COMP and Governance codebase is available to review on Github
-![compound治理合约下载位置](https://github.com/sole12343/Governance_doc/blob/main/png/3.png )
+![compound治理合约下载位置](https://github.com/sole12343/Governance_doc/blob/main/png/5.png )
