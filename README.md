@@ -24,7 +24,9 @@ DAO中修改合约参数或升级等功能，是不能人为干预，必须经�
 ![不标准的代币处理](https://github.com/sole12343/Governance_doc/blob/main/png/4.png )
 
 ## 二、代码详解
-见代码详解文件夹的markdown
+见-代码详解-文件夹的 code.md
+
+也可以直接看@openzeppelin文件夹，里面也有注释
 
 ## 三、治理合约js测试案例
 tkc-Governor是测试案例，里面包括先部署erc20合约，再将此erc20代币转换成支持erc20votes的代币，和部署时间锁和治理合约，并且成功发起一项投票，并且使投票通过等一系列测试
