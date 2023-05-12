@@ -27,6 +27,10 @@ DAO中修改合约参数或升级等功能，是不能人为干预，必须经�
 见代码详解文件夹的markdown
 
 ## 三、治理合约js测试案例
-
+tkc-Governor是测试案例，里面包括先部署erc20合约，再将此erc20代币转换成支持erc20votes的代币，和部署时间锁和治理合约，并且成功发起一项投票，并且使投票通过等一系列测试
 
 ## 四、compound
+- COMP has been deployed to 0xc00e94cb662c3520282e6f5717214004a7f26888
+- Governance has been deployed to 0xc0dA01a04C3f3E0be433606045bB7017A7323E38
+- The COMP and Governance codebase is available to review on Github
+![compound治理合约下载位置](https://github.com/sole12343/Governance_doc/blob/main/png/3.png )
