@@ -1056,3 +1056,1428 @@ GovernorVotes.sol 负责传入代币合约
 GovernorVotesQuorumFraction.sol 充当了提案的法定人数判定机制，帮助确保只有在达到一定投票权重阈值的情况下，提案才能成功通过。
 
 GovernorTimelockControl.sol 合约充当了一个与TimelockController绑定的治理实现，增加了提案执行的延迟，并对提案的状态进行了扩展。
+
+### Governor.sol
+
+```javascript
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (governance/Governor.sol)
+
+pragma solidity ^0.8.0;
+
+import "../token/ERC721/IERC721Receiver.sol";
+import "../token/ERC1155/IERC1155Receiver.sol";
+import "../utils/cryptography/ECDSA.sol";
+import "../utils/cryptography/EIP712.sol";
+import "../utils/introspection/ERC165.sol";
+import "../utils/math/SafeCast.sol";
+import "../utils/structs/DoubleEndedQueue.sol";
+import "../utils/Address.sol";
+import "../utils/Context.sol";
+import "../utils/Timers.sol";
+import "./IGovernor.sol";
+
+/**
+ * @dev Core of the governance system, designed to be extended though various modules.
+ *
+ * This contract is abstract and requires several function to be implemented in various modules:
+ *
+ * - A counting module must implement {quorum}, {_quorumReached}, {_voteSucceeded} and {_countVote}
+ * - A voting module must implement {_getVotes}
+ * - Additionanly, the {votingPeriod} must also be implemented
+ *
+ * _Available since v4.3._
+ */
+abstract contract Governor is Context, ERC165, EIP712, IGovernor, IERC721Receiver, IERC1155Receiver {
+    using DoubleEndedQueue for DoubleEndedQueue.Bytes32Deque;
+    using SafeCast for uint256;
+    using Timers for Timers.BlockNumber;
+    //Ballot 是一个简单的投票类型。里面只包括id和赞成反对弃权
+    bytes32 public constant BALLOT_TYPEHASH = keccak256("Ballot(uint256 proposalId,uint8 support)");
+    // ExtendedBallot 是一个扩展的投票类型。里面包括id和赞成反对弃权，原因和参数
+    bytes32 public constant EXTENDED_BALLOT_TYPEHASH =
+        keccak256("ExtendedBallot(uint256 proposalId,uint8 support,string reason,bytes params)");
+
+    struct ProposalCore {
+        Timers.BlockNumber voteStart;
+        Timers.BlockNumber voteEnd;
+        bool executed;
+        bool canceled;
+    }
+
+    string private _name;
+
+    mapping(uint256 => ProposalCore) private _proposals;//存放所有的提案
+
+    // This queue keeps track of the governor operating on itself. Calls to functions protected by the
+    // {onlyGovernance} modifier needs to be whitelisted in this queue. Whitelisting is set in {_beforeExecute},
+    // consumed by the {onlyGovernance} modifier and eventually reset in {_afterExecute}. This ensures that the
+    // execution of {onlyGovernance} protected calls can only be achieved through successful proposals.
+    //一种特定的双端队列，其中的元素类型为bytes32。
+    DoubleEndedQueue.Bytes32Deque private _governanceCall;
+
+    /**
+     * @dev Restricts a function so it can only be executed through governance proposals. For example, governance
+     * parameter setters in {GovernorSettings} are protected using this modifier.
+     *
+     * The governance executing address may be different from the Governor's own address, for example it could be a
+     * timelock. This can be customized by modules by overriding {_executor}. The executor is only able to invoke these
+     * functions during the execution of the governor's {execute} function, and not under any other circumstances. Thus,
+     * for example, additional timelock proposers are not able to change governance parameters without going through the
+     * governance protocol (since v4.6).
+     */
+    //首先，它检查调用者（_msgSender()）是否与执行者（_executor()）相同，如果不相同，则抛出异常。
+    // 如果执行者不是 Governor 合约本身（可能是 Timelock），则执行以下操作：
+    // a. 计算当前调用的消息数据（_msgData()）的哈希值。
+    // b. 从 _governanceCall 双端队列中移除元素，直到找到与期望操作匹配的哈希值。如果队列为空，则抛出异常，表示操作未获得授权。
+    modifier onlyGovernance() {
+        require(_msgSender() == _executor(), "Governor: onlyGovernance");
+        if (_executor() != address(this)) {
+            bytes32 msgDataHash = keccak256(_msgData());
+            // loop until popping the expected operation - throw if deque is empty (operation not authorized)
+            while (_governanceCall.popFront() != msgDataHash) {}
+        }
+        _;
+    }
+
+    /**
+     * @dev Sets the value for {name} and {version}
+     */
+    constructor(string memory name_) EIP712(name_, version()) {
+        _name = name_;
+    }
+
+    /**
+     * @dev Function to receive ETH that will be handled by the governor (disabled if executor is a third party contract)
+     */
+    //只有当治理合约本身作为执行者时，才允许接收以太币。
+    //这个限制条件可以帮助确保，如果执行者是一个第三方合约，那么这个治理合约将不会意外地接收以太币。
+    //这种设计可以帮助减少错误或者恶意行为导致的风险。
+    receive() external payable virtual {
+        require(_executor() == address(this));
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(IERC165, ERC165) returns (bool) {
+        // In addition to the current interfaceId, also support previous version of the interfaceId that did not
+        // include the castVoteWithReasonAndParams() function as standard
+        return
+            interfaceId ==
+            (type(IGovernor).interfaceId ^
+                this.castVoteWithReasonAndParams.selector ^
+                this.castVoteWithReasonAndParamsBySig.selector ^
+                this.getVotesWithParams.selector) ||
+            interfaceId == type(IGovernor).interfaceId ||
+            interfaceId == type(IERC1155Receiver).interfaceId ||
+            super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev See {IGovernor-name}.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev See {IGovernor-version}.
+     */
+    function version() public view virtual override returns (string memory) {
+        return "1";
+    }
+
+    /**
+     * @dev See {IGovernor-hashProposal}.
+     *
+     * The proposal id is produced by hashing the ABI encoded `targets` array, the `values` array, the `calldatas` array
+     * and the descriptionHash (bytes32 which itself is the keccak256 hash of the description string). This proposal id
+     * can be produced from the proposal data which is part of the {ProposalCreated} event. It can even be computed in
+     * advance, before the proposal is submitted.
+     *
+     * Note that the chainId and the governor address are not part of the proposal id computation. Consequently, the
+     * same proposal (with same operation and same description) will have the same id if submitted on multiple governors
+     * across multiple networks. This also means that in order to execute the same operation twice (on the same
+     * governor) the proposer will have to change the description in order to avoid proposal id conflicts.
+     */
+    //！！！此处需要注意，chainId 和 governor 地址不是提案 ID 计算的一部分。
+    //如果在多个网络上的多个治理者上提交相同的提案，会有相同的提案ID，为了解决这个问题，必须修改描述词
+    function hashProposal(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public pure virtual override returns (uint256) {
+        return uint256(keccak256(abi.encode(targets, values, calldatas, descriptionHash)));
+    }
+
+    /**
+     * @dev See {IGovernor-state}.
+     */
+    // 
+    //返回对应proposalId的提案的状态
+    function state(uint256 proposalId) public view virtual override returns (ProposalState) {
+        ProposalCore storage proposal = _proposals[proposalId];
+
+        if (proposal.executed) {
+            return ProposalState.Executed;
+        }
+
+        if (proposal.canceled) {
+            return ProposalState.Canceled;
+        }
+
+        uint256 snapshot = proposalSnapshot(proposalId);//提案的开始区块号
+
+        if (snapshot == 0) {
+            revert("Governor: unknown proposal id");
+        }
+
+        if (snapshot >= block.number) {
+            return ProposalState.Pending;
+        }
+
+        uint256 deadline = proposalDeadline(proposalId);
+
+        if (deadline >= block.number) {
+            return ProposalState.Active;
+        }
+
+        if (_quorumReached(proposalId) && _voteSucceeded(proposalId)) {
+            return ProposalState.Succeeded;
+        } else {
+            return ProposalState.Defeated;
+        }
+    }
+
+    /**
+     * @dev See {IGovernor-proposalSnapshot}.
+     */
+    //返回给定提案 ID 的投票开始区块号
+    function proposalSnapshot(uint256 proposalId) public view virtual override returns (uint256) {
+        return _proposals[proposalId].voteStart.getDeadline();
+    }
+
+    /**
+     * @dev See {IGovernor-proposalDeadline}.
+     */
+    //返回给定提案 ID 的投票结束区块号
+    function proposalDeadline(uint256 proposalId) public view virtual override returns (uint256) {
+        return _proposals[proposalId].voteEnd.getDeadline();
+    }
+
+    /**
+     * @dev Part of the Governor Bravo's interface: _"The number of votes required in order for a voter to become a proposer"_.
+     */
+    //！！！注意：这里可能需要覆盖，此函数代表，可以发起提案的阈值,有多少投票权才有资格发起提案
+    function proposalThreshold() public view virtual returns (uint256) {
+        return 0;
+    }
+
+    /**
+     * @dev Amount of votes already cast passes the threshold limit.
+     */
+    //判断投票的数量是否已经达到了门槛限制
+    function _quorumReached(uint256 proposalId) internal view virtual returns (bool);
+
+    /**
+     * @dev Is the proposal successful or not.
+     */
+    function _voteSucceeded(uint256 proposalId) internal view virtual returns (bool);
+
+    /**
+     * @dev Get the voting weight of `account` at a specific `blockNumber`, for a vote as described by `params`.
+     */
+    function _getVotes(
+        address account,
+        uint256 blockNumber,
+        bytes memory params
+    ) internal view virtual returns (uint256);
+
+    /**
+     * @dev Register a vote for `proposalId` by `account` with a given `support`, voting `weight` and voting `params`.
+     *
+     * Note: Support is generic and can represent various things depending on the voting system used.
+     */
+    function _countVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        uint256 weight,
+        bytes memory params
+    ) internal virtual;
+
+    /**
+     * @dev Default additional encoded parameters used by castVote methods that don't include them
+     *
+     * Note: Should be overridden by specific implementations to use an appropriate value, the
+     * meaning of the additional params, in the context of that implementation
+     */
+    function _defaultParams() internal view virtual returns (bytes memory) {
+        return "";
+    }
+
+    /**
+     * @dev See {IGovernor-propose}.
+     */
+    function propose(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        string memory description
+    ) public virtual override returns (uint256) {
+        require(
+            getVotes(_msgSender(), block.number - 1) >= proposalThreshold(),
+            "Governor: proposer votes below proposal threshold"
+        );
+
+        uint256 proposalId = hashProposal(targets, values, calldatas, keccak256(bytes(description)));
+
+        require(targets.length == values.length, "Governor: invalid proposal length");
+        require(targets.length == calldatas.length, "Governor: invalid proposal length");
+        require(targets.length > 0, "Governor: empty proposal");
+
+        ProposalCore storage proposal = _proposals[proposalId];
+        require(proposal.voteStart.isUnset(), "Governor: proposal already exists");
+        //需要提案的开始区块号是0
+
+        uint64 snapshot = block.number.toUint64() + votingDelay().toUint64();
+        uint64 deadline = snapshot + votingPeriod().toUint64();
+
+        proposal.voteStart.setDeadline(snapshot);
+        proposal.voteEnd.setDeadline(deadline);
+
+        emit ProposalCreated(
+            proposalId,
+            _msgSender(),
+            targets,
+            values,
+            new string[](targets.length),
+            calldatas,
+            snapshot,
+            deadline,
+            description
+        );
+
+        return proposalId;
+    }
+
+    /**
+     * @dev See {IGovernor-execute}.
+     */
+    function execute(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public payable virtual override returns (uint256) {
+        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
+
+        ProposalState status = state(proposalId);
+        require(
+            status == ProposalState.Succeeded || status == ProposalState.Queued,
+            "Governor: proposal not successful"
+        );
+        _proposals[proposalId].executed = true;
+
+        emit ProposalExecuted(proposalId);
+
+        _beforeExecute(proposalId, targets, values, calldatas, descriptionHash);
+        _execute(proposalId, targets, values, calldatas, descriptionHash);
+        _afterExecute(proposalId, targets, values, calldatas, descriptionHash);
+
+        return proposalId;
+    }
+
+    /**
+     * @dev Internal execution mechanism. Can be overridden to implement different execution mechanism
+     */
+    function _execute(
+        uint256, /* proposalId */
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 /*descriptionHash*/
+    ) internal virtual {
+        string memory errorMessage = "Governor: call reverted without message";
+        for (uint256 i = 0; i < targets.length; ++i) {
+            (bool success, bytes memory returndata) = targets[i].call{value: values[i]}(calldatas[i]);
+            Address.verifyCallResult(success, returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Hook before execution is triggered.
+     */
+    function _beforeExecute(
+        uint256, /* proposalId */
+        address[] memory targets,
+        uint256[] memory, /* values */
+        bytes[] memory calldatas,
+        bytes32 /*descriptionHash*/
+    ) internal virtual {
+        if (_executor() != address(this)) {
+            for (uint256 i = 0; i < targets.length; ++i) {
+                if (targets[i] == address(this)) {
+                    _governanceCall.pushBack(keccak256(calldatas[i]));//将目标地址为治理合约本身的交易筛选出来
+                }
+            }
+        }
+    }
+
+    /**
+     * @dev Hook after execution is triggered.
+     */
+    function _afterExecute(
+        uint256, /* proposalId */
+        address[] memory, /* targets */
+        uint256[] memory, /* values */
+        bytes[] memory, /* calldatas */
+        bytes32 /*descriptionHash*/
+    ) internal virtual {
+        if (_executor() != address(this)) {
+            if (!_governanceCall.empty()) {//当执行完毕后，会清空那些只能治理合约执行的调用队列
+                _governanceCall.clear();
+            }
+        }
+    }
+
+    /**
+     * @dev Internal cancel mechanism: locks up the proposal timer, preventing it from being re-submitted. Marks it as
+     * canceled to allow distinguishing it from executed proposals.
+     *
+     * Emits a {IGovernor-ProposalCanceled} event.
+     */
+    function _cancel(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal virtual returns (uint256) {
+        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
+        ProposalState status = state(proposalId);
+
+        require(
+            status != ProposalState.Canceled && status != ProposalState.Expired && status != ProposalState.Executed,
+            "Governor: proposal not active"
+        );
+        _proposals[proposalId].canceled = true;
+
+        emit ProposalCanceled(proposalId);
+
+        return proposalId;
+    }
+
+    /**
+     * @dev See {IGovernor-getVotes}.
+     */
+    function getVotes(address account, uint256 blockNumber) public view virtual override returns (uint256) {
+        return _getVotes(account, blockNumber, _defaultParams());
+    }
+
+    /**
+     * @dev See {IGovernor-getVotesWithParams}.
+     */
+    function getVotesWithParams(
+        address account,
+        uint256 blockNumber,
+        bytes memory params
+    ) public view virtual override returns (uint256) {
+        return _getVotes(account, blockNumber, params);
+    }
+
+    /**
+     * @dev See {IGovernor-castVote}.
+     */
+    //进行投票的方法 2-弃权 1-支持 0-反对
+    function castVote(uint256 proposalId, uint8 support) public virtual override returns (uint256) {
+        address voter = _msgSender();
+        return _castVote(proposalId, voter, support, "");
+    }
+
+    /**
+     * @dev See {IGovernor-castVoteWithReason}.
+     */
+    function castVoteWithReason(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason
+    ) public virtual override returns (uint256) {
+        address voter = _msgSender();
+        return _castVote(proposalId, voter, support, reason);
+    }
+
+    /**
+     * @dev See {IGovernor-castVoteWithReasonAndParams}.
+     */
+    function castVoteWithReasonAndParams(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason,
+        bytes memory params
+    ) public virtual override returns (uint256) {
+        address voter = _msgSender();
+        return _castVote(proposalId, voter, support, reason, params);
+    }
+
+    /**
+     * @dev See {IGovernor-castVoteBySig}.
+     */
+    function castVoteBySig(
+        uint256 proposalId,
+        uint8 support,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual override returns (uint256) {
+        address voter = ECDSA.recover(
+            _hashTypedDataV4(keccak256(abi.encode(BALLOT_TYPEHASH, proposalId, support))),
+            v,
+            r,
+            s
+        );
+        return _castVote(proposalId, voter, support, "");
+    }
+
+    /**
+     * @dev See {IGovernor-castVoteWithReasonAndParamsBySig}.
+     */
+    function castVoteWithReasonAndParamsBySig(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason,
+        bytes memory params,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual override returns (uint256) {
+        address voter = ECDSA.recover(
+            _hashTypedDataV4(
+                keccak256(
+                    abi.encode(
+                        EXTENDED_BALLOT_TYPEHASH,
+                        proposalId,
+                        support,
+                        keccak256(bytes(reason)),
+                        keccak256(params)
+                    )
+                )
+            ),
+            v,
+            r,
+            s
+        );
+
+        return _castVote(proposalId, voter, support, reason, params);
+    }
+
+    /**
+     * @dev Internal vote casting mechanism: Check that the vote is pending, that it has not been cast yet, retrieve
+     * voting weight using {IGovernor-getVotes} and call the {_countVote} internal function. Uses the _defaultParams().
+     *
+     * Emits a {IGovernor-VoteCast} event.
+     */
+    function _castVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        string memory reason
+    ) internal virtual returns (uint256) {
+        return _castVote(proposalId, account, support, reason, _defaultParams());
+    }
+
+    /**
+     * @dev Internal vote casting mechanism: Check that the vote is pending, that it has not been cast yet, retrieve
+     * voting weight using {IGovernor-getVotes} and call the {_countVote} internal function.
+     *
+     * Emits a {IGovernor-VoteCast} event.
+     */
+    function _castVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        string memory reason,
+        bytes memory params
+    ) internal virtual returns (uint256) {
+        ProposalCore storage proposal = _proposals[proposalId];
+        require(state(proposalId) == ProposalState.Active, "Governor: vote not currently active");
+
+        uint256 weight = _getVotes(account, proposal.voteStart.getDeadline(), params);
+        _countVote(proposalId, account, support, weight, params);//？
+
+        if (params.length == 0) {
+            emit VoteCast(account, proposalId, support, weight, reason);
+        } else {
+            emit VoteCastWithParams(account, proposalId, support, weight, reason, params);
+        }
+
+        return weight;
+    }
+
+    /**
+     * @dev Relays a transaction or function call to an arbitrary target. In cases where the governance executor
+     * is some contract other than the governor itself, like when using a timelock, this function can be invoked
+     * in a governance proposal to recover tokens or Ether that was sent to the governor contract by mistake.
+     * Note that if the executor is simply the governor itself, use of `relay` is redundant.
+     */
+    //此处方法可以帮助找回失误发送到此合约的代币，如果提案的执行者只有治理合约，此方法不需要
+    function relay(
+        address target,
+        uint256 value,
+        bytes calldata data
+    ) external payable virtual onlyGovernance {
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        Address.verifyCallResult(success, returndata, "Governor: relay reverted without message");
+    }
+
+    /**
+     * @dev Address through which the governor executes action. Will be overloaded by module that execute actions
+     * through another contract such as a timelock.
+     */
+    // 注意：可能会时间锁合约重载，修改这里
+    function _executor() internal view virtual returns (address) {
+        return address(this);
+    }
+
+    /**
+     * @dev See {IERC721Receiver-onERC721Received}.
+     */
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    /**
+     * @dev See {IERC1155Receiver-onERC1155Received}.
+     */
+    function onERC1155Received(
+        address,
+        address,
+        uint256,
+        uint256,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    /**
+     * @dev See {IERC1155Receiver-onERC1155BatchReceived}.
+     */
+    function onERC1155BatchReceived(
+        address,
+        address,
+        uint256[] memory,
+        uint256[] memory,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC1155BatchReceived.selector;
+    }
+}
+```
+
+### GovernorSettings.sol
+```javascript
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (governance/extensions/GovernorSettings.sol)
+
+pragma solidity ^0.8.0;
+
+import "../Governor.sol";
+
+/**
+ * @dev Extension of {Governor} for settings updatable through governance.
+ *
+ * _Available since v4.4._
+ */
+abstract contract GovernorSettings is Governor {
+    uint256 private _votingDelay;// 延迟几个区块，才开始投票
+    uint256 private _votingPeriod;// 开始投票到投票结束用多少区块
+    uint256 private _proposalThreshold;//可以发起提案的阈值,有多少投票权才有资格发起提案
+
+    event VotingDelaySet(uint256 oldVotingDelay, uint256 newVotingDelay);
+    event VotingPeriodSet(uint256 oldVotingPeriod, uint256 newVotingPeriod);
+    event ProposalThresholdSet(uint256 oldProposalThreshold, uint256 newProposalThreshold);
+
+    /**
+     * @dev Initialize the governance parameters.
+     */
+    constructor(
+        uint256 initialVotingDelay,
+        uint256 initialVotingPeriod,
+        uint256 initialProposalThreshold
+    ) {
+        _setVotingDelay(initialVotingDelay);
+        _setVotingPeriod(initialVotingPeriod);
+        _setProposalThreshold(initialProposalThreshold);
+    }
+
+    /**
+     * @dev See {IGovernor-votingDelay}.
+     */
+    function votingDelay() public view virtual override returns (uint256) {
+        return _votingDelay;
+    }
+
+    /**
+     * @dev See {IGovernor-votingPeriod}.
+     */
+    function votingPeriod() public view virtual override returns (uint256) {
+        return _votingPeriod;
+    }
+
+    /**
+     * @dev See {Governor-proposalThreshold}.
+     */
+    function proposalThreshold() public view virtual override returns (uint256) {
+        return _proposalThreshold;
+    }
+
+    /**
+     * @dev Update the voting delay. This operation can only be performed through a governance proposal.
+     *
+     * Emits a {VotingDelaySet} event.
+     */
+    //只有在经过治理提案批准的情况下，这种方法方法才能被调用。
+    function setVotingDelay(uint256 newVotingDelay) public virtual onlyGovernance {
+        _setVotingDelay(newVotingDelay);
+    }
+
+    /**
+     * @dev Update the voting period. This operation can only be performed through a governance proposal.
+     *
+     * Emits a {VotingPeriodSet} event.
+     */
+    function setVotingPeriod(uint256 newVotingPeriod) public virtual onlyGovernance {
+        _setVotingPeriod(newVotingPeriod);
+    }
+
+    /**
+     * @dev Update the proposal threshold. This operation can only be performed through a governance proposal.
+     *
+     * Emits a {ProposalThresholdSet} event.
+     */
+    function setProposalThreshold(uint256 newProposalThreshold) public virtual onlyGovernance {
+        _setProposalThreshold(newProposalThreshold);
+    }
+
+    /**
+     * @dev Internal setter for the voting delay.
+     *
+     * Emits a {VotingDelaySet} event.
+     */
+    function _setVotingDelay(uint256 newVotingDelay) internal virtual {
+        emit VotingDelaySet(_votingDelay, newVotingDelay);
+        _votingDelay = newVotingDelay;
+    }
+
+    /**
+     * @dev Internal setter for the voting period.
+     *
+     * Emits a {VotingPeriodSet} event.
+     */
+    function _setVotingPeriod(uint256 newVotingPeriod) internal virtual {
+        // voting period must be at least one block long
+        require(newVotingPeriod > 0, "GovernorSettings: voting period too low");
+        emit VotingPeriodSet(_votingPeriod, newVotingPeriod);
+        _votingPeriod = newVotingPeriod;
+    }
+
+    /**
+     * @dev Internal setter for the proposal threshold.
+     *
+     * Emits a {ProposalThresholdSet} event.
+     */
+    function _setProposalThreshold(uint256 newProposalThreshold) internal virtual {
+        emit ProposalThresholdSet(_proposalThreshold, newProposalThreshold);
+        _proposalThreshold = newProposalThreshold;
+    }
+}
+```
+
+### GovernorCountingSimple.sol
+```javascript
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (governance/extensions/GovernorCountingSimple.sol)
+
+pragma solidity ^0.8.0;
+
+import "../Governor.sol";
+
+/**
+ * @dev Extension of {Governor} for simple, 3 options, vote counting.
+ *
+ * _Available since v4.3._
+ */
+abstract contract GovernorCountingSimple is Governor {
+    /**
+     * @dev Supported vote types. Matches Governor Bravo ordering.
+     */
+    enum VoteType {
+        Against,
+        For,
+        Abstain
+    }
+    //记录某个提案的三种票的数量
+    struct ProposalVote {
+        uint256 againstVotes;
+        uint256 forVotes;
+        uint256 abstainVotes;
+        mapping(address => bool) hasVoted;
+    }
+
+    mapping(uint256 => ProposalVote) private _proposalVotes;//每个提案id对应一个提案vote结构体
+
+    /**
+     * @dev See {IGovernor-COUNTING_MODE}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    //注意：这是投票计数和提案的规则说明，可能需要覆盖，也可以自定义的创新投票的规则
+    //默认情况下是 支持反对弃权三种票 & 赞成和弃权都算进法定人数中去
+    /**
+     * 支持（support）：
+        support=bravo：表示投票选项有3种，0 = 反对（Against），1 = 赞成（For），2 = 弃权（Abstain）。这种模式在GovernorBravo中使用。
+        法定人数（quorum）：
+
+        quorum=bravo：表示只有赞成票计入法定人数。
+        quorum=for,abstain：表示赞成票和弃权票都计入法定人数。
+        自定义参数（params）：
+
+        如果某个投票计数模块使用了编码的params，则应在params键下使用一个描述行为的唯一名称。例如：
+        params=fractional：可能指的是一种投票方案，其中票数在赞成/反对/弃权之间进行分数划分。
+        params=erc721：可能指的是一种方案，其中特定的NFT被委托投票。
+     */ 
+    function COUNTING_MODE() public pure virtual override returns (string memory) {
+        return "support=bravo&quorum=for,abstain";
+    }
+
+    /**
+     * @dev See {IGovernor-hasVoted}.
+     */
+    function hasVoted(uint256 proposalId, address account) public view virtual override returns (bool) {
+        return _proposalVotes[proposalId].hasVoted[account];
+    }
+
+    /**
+     * @dev Accessor to the internal vote counts.
+     */
+    //给定某个提案id返回此提案的三种选票的数量
+    function proposalVotes(uint256 proposalId)
+        public
+        view
+        virtual
+        returns (
+            uint256 againstVotes,
+            uint256 forVotes,
+            uint256 abstainVotes
+        )
+    {
+        ProposalVote storage proposalVote = _proposalVotes[proposalId];
+        return (proposalVote.againstVotes, proposalVote.forVotes, proposalVote.abstainVotes);
+    }
+
+    /**
+     * @dev See {Governor-_quorumReached}.
+     */
+    // quorum()是通过计算给定区块号的代币的totalsupply * 法定人数的比例来得到的
+    // 注意：这里如果修改上面的计算模式，可能也要重写修改，此处是计算投票赞成+弃权的总数 
+    function _quorumReached(uint256 proposalId) internal view virtual override returns (bool) {
+        ProposalVote storage proposalVote = _proposalVotes[proposalId];
+
+        return quorum(proposalSnapshot(proposalId)) <= proposalVote.forVotes + proposalVote.abstainVotes;
+    }
+
+    /**
+     * @dev See {Governor-_voteSucceeded}. In this module, the forVotes must be strictly over the againstVotes.
+     */
+    // 此处只有赞成票 > 反对票，投票才会成功
+    // 注意：此处可能需要覆盖重写
+    function _voteSucceeded(uint256 proposalId) internal view virtual override returns (bool) {
+        ProposalVote storage proposalVote = _proposalVotes[proposalId];
+
+        return proposalVote.forVotes > proposalVote.againstVotes;
+    }
+
+    /**
+     * @dev See {Governor-_countVote}. In this module, the support follows the `VoteType` enum (from Governor Bravo).
+     */
+    // 对某一个地址的一次投票行为，进行计数，注意：如果对上述投票模型进行自定义修改，此处也需要重写
+    function _countVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        uint256 weight,
+        bytes memory // params
+    ) internal virtual override {
+        ProposalVote storage proposalVote = _proposalVotes[proposalId];
+
+        require(!proposalVote.hasVoted[account], "GovernorVotingSimple: vote already cast");
+        proposalVote.hasVoted[account] = true;
+
+        if (support == uint8(VoteType.Against)) {
+            proposalVote.againstVotes += weight;
+        } else if (support == uint8(VoteType.For)) {
+            proposalVote.forVotes += weight;
+        } else if (support == uint8(VoteType.Abstain)) {
+            proposalVote.abstainVotes += weight;
+        } else {
+            revert("GovernorVotingSimple: invalid value for enum VoteType");
+        }
+    }
+}
+```
+
+### Votes.sol
+```javascript
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (governance/utils/Votes.sol)
+pragma solidity ^0.8.0;
+
+import "../../utils/Context.sol";
+import "../../utils/Counters.sol";
+import "../../utils/Checkpoints.sol";
+import "../../utils/cryptography/EIP712.sol";
+import "./IVotes.sol";
+
+/**
+ * @dev This is a base abstract contract that tracks voting units, which are a measure of voting power that can be
+ * transferred, and provides a system of vote delegation, where an account can delegate its voting units to a sort of
+ * "representative" that will pool delegated voting units from different accounts and can then use it to vote in
+ * decisions. In fact, voting units _must_ be delegated in order to count as actual votes, and an account has to
+ * delegate those votes to itself if it wishes to participate in decisions and does not have a trusted representative.
+ *
+ * This contract is often combined with a token contract such that voting units correspond to token units. For an
+ * example, see {ERC721Votes}.
+ *
+ * The full history of delegate votes is tracked on-chain so that governance protocols can consider votes as distributed
+ * at a particular block number to protect against flash loans and double voting. The opt-in delegate system makes the
+ * cost of this history tracking optional.
+ *
+ * When using this module the derived contract must implement {_getVotingUnits} (for example, make it return
+ * {ERC721-balanceOf}), and can use {_transferVotingUnits} to track a change in the distribution of those units (in the
+ * previous example, it would be included in {ERC721-_beforeTokenTransfer}).
+ *
+ * _Available since v4.5._
+ */
+abstract contract Votes is IVotes, Context, EIP712 {
+    using Checkpoints for Checkpoints.History;//_checkpoints结构体数组，包含blocknum 和 value
+    using Counters for Counters.Counter;
+
+    bytes32 private constant _DELEGATION_TYPEHASH =
+        keccak256("Delegation(address delegatee,uint256 nonce,uint256 expiry)");
+
+    mapping(address => address) private _delegation;
+    mapping(address => Checkpoints.History) private _delegateCheckpoints;
+    Checkpoints.History private _totalCheckpoints;
+
+    mapping(address => Counters.Counter) private _nonces;
+
+    /**
+     * @dev Returns the current amount of votes that `account` has.
+     */
+    // 得到输入account的最新投票权数量
+    function getVotes(address account) public view virtual override returns (uint256) {
+        return _delegateCheckpoints[account].latest();
+    }
+
+    /**
+     * @dev Returns the amount of votes that `account` had at the end of a past block (`blockNumber`).
+     *
+     * Requirements:
+     *
+     * - `blockNumber` must have been already mined
+     */
+    //得到 输入account用户的某一区块号时的投票权数量
+    function getPastVotes(address account, uint256 blockNumber) public view virtual override returns (uint256) {
+        return _delegateCheckpoints[account].getAtProbablyRecentBlock(blockNumber);
+    }
+
+    /**
+     * @dev Returns the total supply of votes available at the end of a past block (`blockNumber`).
+     *
+     * NOTE: This value is the sum of all available votes, which is not necessarily the sum of all delegated votes.
+     * Votes that have not been delegated are still part of total supply, even though they would not participate in a
+     * vote.
+     *
+     * Requirements:
+     *
+     * - `blockNumber` must have been already mined
+     */
+    function getPastTotalSupply(uint256 blockNumber) public view virtual override returns (uint256) {
+        require(blockNumber < block.number, "Votes: block not yet mined");
+        return _totalCheckpoints.getAtProbablyRecentBlock(blockNumber);
+    }
+
+    /**
+     * @dev Returns the current total supply of votes.
+     */
+    function _getTotalSupply() internal view virtual returns (uint256) {
+        return _totalCheckpoints.latest();
+    }
+
+    /**
+     * @dev Returns the delegate that `account` has chosen.
+     */
+    // 这里是只返回account地址的当前 委托地址，有的话只有一个
+    function delegates(address account) public view virtual override returns (address) {
+        return _delegation[account];
+    }
+
+    /**
+     * @dev Delegates votes from the sender to `delegatee`.
+     */
+    function delegate(address delegatee) public virtual override {
+        address account = _msgSender();
+        _delegate(account, delegatee);
+    }
+
+    /**
+     * @dev Delegates votes from signer to `delegatee`.
+     */
+    function delegateBySig(
+        address delegatee,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual override {
+        require(block.timestamp <= expiry, "Votes: signature expired");
+        address signer = ECDSA.recover(
+            _hashTypedDataV4(keccak256(abi.encode(_DELEGATION_TYPEHASH, delegatee, nonce, expiry))),
+            v,
+            r,
+            s
+        );
+        require(nonce == _useNonce(signer), "Votes: invalid nonce");
+        _delegate(signer, delegatee);
+    }
+
+    /**
+     * @dev Delegate all of `account`'s voting units to `delegatee`.
+     *
+     * Emits events {IVotes-DelegateChanged} and {IVotes-DelegateVotesChanged}.
+     */
+    // 这里是核心操作
+    function _delegate(address account, address delegatee) internal virtual {
+        address oldDelegate = delegates(account);
+        _delegation[account] = delegatee;
+
+        emit DelegateChanged(account, oldDelegate, delegatee);
+        _moveDelegateVotes(oldDelegate, delegatee, _getVotingUnits(account));
+    }
+
+    /**
+     * @dev Transfers, mints, or burns voting units. To register a mint, `from` should be zero. To register a burn, `to`
+     * should be zero. Total supply of voting units will be adjusted with mints and burns.
+     */
+    function _transferVotingUnits(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {
+        if (from == address(0)) {
+            _totalCheckpoints.push(_add, amount);
+        }
+        if (to == address(0)) {
+            _totalCheckpoints.push(_subtract, amount);
+        }
+        // 这里如果自己想要参与投票，必须先对自己delegate，所以每个选票的代币都有代理者，可能是自己也可能是别人
+        // 那么转账，只需要from的代理者减少amount，to的代理者增加amount就可以
+        _moveDelegateVotes(delegates(from), delegates(to), amount);
+    }
+
+    /**
+     * @dev Moves delegated votes from one delegate to another.
+     */
+    function _moveDelegateVotes(
+        address from,
+        address to,
+        uint256 amount
+    ) private {
+        if (from != to && amount > 0) {
+            if (from != address(0)) {
+                (uint256 oldValue, uint256 newValue) = _delegateCheckpoints[from].push(_subtract, amount);
+                emit DelegateVotesChanged(from, oldValue, newValue);
+            }
+            if (to != address(0)) {
+                (uint256 oldValue, uint256 newValue) = _delegateCheckpoints[to].push(_add, amount);//push会做很多操作，最终返回旧值和新值
+                emit DelegateVotesChanged(to, oldValue, newValue);
+            }
+        }
+    }
+
+    function _add(uint256 a, uint256 b) private pure returns (uint256) {
+        return a + b;
+    }
+
+    function _subtract(uint256 a, uint256 b) private pure returns (uint256) {
+        return a - b;
+    }
+
+    /**
+     * @dev Consumes a nonce.
+     *
+     * Returns the current value and increments nonce.
+     */
+    function _useNonce(address owner) internal virtual returns (uint256 current) {
+        Counters.Counter storage nonce = _nonces[owner];
+        current = nonce.current();
+        nonce.increment();
+    }
+
+    /**
+     * @dev Returns an address nonce.
+     */
+    function nonces(address owner) public view virtual returns (uint256) {
+        return _nonces[owner].current();
+    }
+
+    /**
+     * @dev Returns the contract's {EIP712} domain separator.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32) {
+        return _domainSeparatorV4();
+    }
+
+    /**
+     * @dev Must return the voting units held by an account.
+     */
+    function _getVotingUnits(address) internal view virtual returns (uint256);
+}
+
+
+```
+
+### GovernorVotesQuorumFraction.sol 
+在治理系统中，此合约实现了以下功能：
+1. 初始化法定人数：构造函数允许您将法定人数设置为代币总供应量的一部分。分数表示为numerator / denominator，默认情况下，分母为100，法定人数以百分比表示，分子为10表示法定人数为总供应量的10％。通过覆盖quorumDenominator函数，可以自定义分母。
+2. 法定人数查找：合约提供了用于查询当前法定人数分子（quorumNumerator）和特定区块号上的法定人数分子（quorumNumerator(uint256 blockNumber)）的方法。此外，还提供了一个方法来获取法定人数分母（quorumDenominator）。
+3. 计算法定人数：quorum方法返回给定区块号的法定人数，表示为投票数量：supply * numerator / denominator。这使得合约可以根据代币供应量的一部分来确定某项提案是否达到法定人数。
+4. 更新法定人数分子：updateQuorumNumerator方法允许通过治理提案更改法定人数分子。新的分子必须小于或等于分母。当更新法定人数分子时，会触发QuorumNumeratorUpdated事件。
+
+```javascript
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (governance/extensions/GovernorVotesQuorumFraction.sol)
+
+pragma solidity ^0.8.0;
+
+import "./GovernorVotes.sol";
+import "../../utils/Checkpoints.sol";
+import "../../utils/math/SafeCast.sol";
+
+/**
+ * @dev Extension of {Governor} for voting weight extraction from an {ERC20Votes} token and a quorum expressed as a
+ * fraction of the total supply.
+ *
+ * _Available since v4.3._
+ */
+abstract contract GovernorVotesQuorumFraction is GovernorVotes {
+    using Checkpoints for Checkpoints.History;
+
+    //注意：这里这个变量已经被弃用，现在都使用_quorumNumeratorHistory来作为代表 
+    // 代表总量的n% ,这样n%的数量为法定总数，引入History可以查到不同区块号的 不同法定人数 的比例
+    uint256 private _quorumNumerator; // DEPRECATED
+    Checkpoints.History private _quorumNumeratorHistory;
+
+    event QuorumNumeratorUpdated(uint256 oldQuorumNumerator, uint256 newQuorumNumerator);
+
+    /**
+     * @dev Initialize quorum as a fraction of the token's total supply.
+     *
+     * The fraction is specified as `numerator / denominator`. By default the denominator is 100, so quorum is
+     * specified as a percent: a numerator of 10 corresponds to quorum being 10% of total supply. The denominator can be
+     * customized by overriding {quorumDenominator}.
+     */
+    // 默认是n/100 ， n是_updateQuorumNumerator设置的值，注意：如果想要修改分母不是100，那么重写quorumDenominator
+    constructor(uint256 quorumNumeratorValue) {
+        _updateQuorumNumerator(quorumNumeratorValue);
+    }
+
+    /**
+     * @dev Returns the current quorum numerator. See {quorumDenominator}.
+     */
+    // 返回当前的法定人数的比例
+    function quorumNumerator() public view virtual returns (uint256) {
+        return _quorumNumeratorHistory._checkpoints.length == 0 ? _quorumNumerator : _quorumNumeratorHistory.latest();
+    }
+
+    /**
+     * @dev Returns the quorum numerator at a specific block number. See {quorumDenominator}.
+     */
+    // 返回某个区块号的法定人数比例分子
+    function quorumNumerator(uint256 blockNumber) public view virtual returns (uint256) {
+        // If history is empty, fallback to old storage
+        uint256 length = _quorumNumeratorHistory._checkpoints.length;
+        if (length == 0) {
+            return _quorumNumerator;
+        }
+
+        // Optimistic search, check the latest checkpoint
+        Checkpoints.Checkpoint memory latest = _quorumNumeratorHistory._checkpoints[length - 1];
+        if (latest._blockNumber <= blockNumber) {
+            return latest._value;
+        }
+
+        // Otherwise, do the binary search
+        return _quorumNumeratorHistory.getAtBlock(blockNumber);
+    }
+
+    /**
+     * @dev Returns the quorum denominator. Defaults to 100, but may be overridden.
+     */
+    // 想要修改分母，重写这里
+    function quorumDenominator() public view virtual returns (uint256) {
+        return 100;
+    }
+
+    /**
+     * @dev Returns the quorum for a block number, in terms of number of votes: `supply * numerator / denominator`.
+     */
+    // 计算法定的代币数量 = 输入区块号的总供应量 *(法定分子比例/分母一般是100)
+    function quorum(uint256 blockNumber) public view virtual override returns (uint256) {
+        return (token.getPastTotalSupply(blockNumber) * quorumNumerator(blockNumber)) / quorumDenominator();
+    }
+
+    /**
+     * @dev Changes the quorum numerator.
+     *
+     * Emits a {QuorumNumeratorUpdated} event.
+     *
+     * Requirements:
+     *
+     * - Must be called through a governance proposal.
+     * - New numerator must be smaller or equal to the denominator.
+     */
+    function updateQuorumNumerator(uint256 newQuorumNumerator) external virtual onlyGovernance {
+        _updateQuorumNumerator(newQuorumNumerator);
+    }
+
+    /**
+     * @dev Changes the quorum numerator.
+     *
+     * Emits a {QuorumNumeratorUpdated} event.
+     *
+     * Requirements:
+     *
+     * - New numerator must be smaller or equal to the denominator.
+     */
+    function _updateQuorumNumerator(uint256 newQuorumNumerator) internal virtual {
+        require(
+            newQuorumNumerator <= quorumDenominator(),
+            "GovernorVotesQuorumFraction: quorumNumerator over quorumDenominator"
+        );
+
+        uint256 oldQuorumNumerator = quorumNumerator();
+
+        // Make sure we keep track of the original numerator in contracts upgraded from a version without checkpoints.
+        if (oldQuorumNumerator != 0 && _quorumNumeratorHistory._checkpoints.length == 0) {
+            _quorumNumeratorHistory._checkpoints.push(
+                Checkpoints.Checkpoint({_blockNumber: 0, _value: SafeCast.toUint224(oldQuorumNumerator)})
+            );
+        }
+
+        // Set new quorum for future proposals
+        _quorumNumeratorHistory.push(newQuorumNumerator);
+
+        emit QuorumNumeratorUpdated(oldQuorumNumerator, newQuorumNumerator);
+    }
+}
+```
+
+
+### GovernorTimelockControl.sol 
+GovernorTimelockControl合约是一个扩展自Governor合约的抽象合约，它将提案的执行过程与TimelockController实例绑定。这为所有成功的提案添加了一个由TimelockController实施的延迟（在投票持续时间之外）。Governor需要提案者（最好还有执行者）角色以正确工作。
+这个合约在治理系统中的作用包括：
+1. 提案的状态：这个合约重写了state函数，增加了对Queued状态的支持。在提案通过后，它可以检查提案是否已进入队列。
+2. 查询timelock：提供了timelock()函数，用于获取与治理系统绑定的TimelockController合约的地址。
+3. 查询提案的ETA（预计执行时间）：通过proposalEta()函数，可以查询一个已入队提案的预计执行时间。
+4. 队列提案：queue()函数用于将成功的提案添加到TimelockController的执行队列中，延迟执行。
+5. 执行提案：重写了_execute()函数，通过TimelockController执行已进入队列的提案。
+6. 取消提案：重写了_cancel()函数，如果提案已进入TimelockController队列，则取消执行。
+7. 更新timelock：提供了updateTimelock()函数，允许通过治理提案更新底层的TimelockController实例。
+
+```javascript
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (governance/extensions/GovernorTimelockControl.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IGovernorTimelock.sol";
+import "../Governor.sol";
+import "../TimelockController.sol";
+
+/**
+ * @dev Extension of {Governor} that binds the execution process to an instance of {TimelockController}. This adds a
+ * delay, enforced by the {TimelockController} to all successful proposal (in addition to the voting duration). The
+ * {Governor} needs the proposer (and ideally the executor) roles for the {Governor} to work properly.
+ *
+ * Using this model means the proposal will be operated by the {TimelockController} and not by the {Governor}. Thus,
+ * the assets and permissions must be attached to the {TimelockController}. Any asset sent to the {Governor} will be
+ * inaccessible.
+ *
+ * WARNING: Setting up the TimelockController to have additional proposers besides the governor is very risky, as it
+ * grants them powers that they must be trusted or known not to use: 1) {onlyGovernance} functions like {relay} are
+ * available to them through the timelock, and 2) approved governance proposals can be blocked by them, effectively
+ * executing a Denial of Service attack. This risk will be mitigated in a future release.
+ *
+ * _Available since v4.3._
+ */
+abstract contract GovernorTimelockControl is IGovernorTimelock, Governor {
+    TimelockController private _timelock; // 时间锁控制器合约
+    mapping(uint256 => bytes32) private _timelockIds;
+
+    /**
+     * @dev Emitted when the timelock controller used for proposal execution is modified.
+     */
+    event TimelockChange(address oldTimelock, address newTimelock);
+
+    /**
+     * @dev Set the timelock.
+     */
+    constructor(TimelockController timelockAddress) {
+        _updateTimelock(timelockAddress);
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(IERC165, Governor) returns (bool) {
+        return interfaceId == type(IGovernorTimelock).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Overridden version of the {Governor-state} function with added support for the `Queued` status.
+     */
+    // 返回提案的状态，相比于Governor合约，增加了队列状态 执行结束状态
+    function state(uint256 proposalId) public view virtual override(IGovernor, Governor) returns (ProposalState) {
+        ProposalState status = super.state(proposalId);
+
+        if (status != ProposalState.Succeeded) {
+            return status;
+        }
+
+        // core tracks execution, so we just have to check if successful proposal have been queued.
+        bytes32 queueid = _timelockIds[proposalId];
+        if (queueid == bytes32(0)) {
+            return status;
+        } else if (_timelock.isOperationDone(queueid)) {
+            return ProposalState.Executed;
+        } else if (_timelock.isOperationPending(queueid)) {
+            return ProposalState.Queued;
+        } else {
+            return ProposalState.Canceled;
+        }
+    }
+
+    /**
+     * @dev Public accessor to check the address of the timelock
+     */
+    function timelock() public view virtual override returns (address) {
+        return address(_timelock);
+    }
+
+    /**
+     * @dev Public accessor to check the eta of a queued proposal
+     */
+    //用于查询已进入执行队列的提案的预计执行时间（ETA）
+    function proposalEta(uint256 proposalId) public view virtual override returns (uint256) {
+        uint256 eta = _timelock.getTimestamp(_timelockIds[proposalId]);
+        return eta == 1 ? 0 : eta; // _DONE_TIMESTAMP (1) should be replaced with a 0 value
+    }
+
+    /**
+     * @dev Function to queue a proposal to the timelock.
+     */
+    // 注意：入队 等待的时间是 MinDelay
+    function queue(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public virtual override returns (uint256) {
+        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
+
+        require(state(proposalId) == ProposalState.Succeeded, "Governor: proposal not successful");
+
+        uint256 delay = _timelock.getMinDelay();
+        _timelockIds[proposalId] = _timelock.hashOperationBatch(targets, values, calldatas, 0, descriptionHash);
+        _timelock.scheduleBatch(targets, values, calldatas, 0, descriptionHash, delay);
+
+        emit ProposalQueued(proposalId, block.timestamp + delay);
+
+        return proposalId;
+    }
+
+    /**
+     * @dev Overridden execute function that run the already queued proposal through the timelock.
+     */
+    function _execute(
+        uint256, /* proposalId */
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal virtual override {
+        _timelock.executeBatch{value: msg.value}(targets, values, calldatas, 0, descriptionHash);
+    }
+
+    /**
+     * @dev Overridden version of the {Governor-_cancel} function to cancel the timelocked proposal if it as already
+     * been queued.
+     */
+    // This function can reenter through the external call to the timelock, but we assume the timelock is trusted and
+    // well behaved (according to TimelockController) and this will not happen.
+    // slither-disable-next-line reentrancy-no-eth
+    // 这个方法确保了在GovernorTimelockControl合约中，
+    // 当一个提案被取消时，与其关联的Timelock操作也会被取消，以保持提案和时间锁操作之间的一致性。
+    function _cancel(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal virtual override returns (uint256) {
+        uint256 proposalId = super._cancel(targets, values, calldatas, descriptionHash);
+
+        if (_timelockIds[proposalId] != 0) {
+            _timelock.cancel(_timelockIds[proposalId]);
+            delete _timelockIds[proposalId];
+        }
+
+        return proposalId;
+    }
+
+    /**
+     * @dev Address through which the governor executes action. In this case, the timelock.
+     */
+    function _executor() internal view virtual override returns (address) {
+        return address(_timelock);
+    }
+
+    /**
+     * @dev Public endpoint to update the underlying timelock instance. Restricted to the timelock itself, so updates
+     * must be proposed, scheduled, and executed through governance proposals.
+     *
+     * CAUTION: It is not recommended to change the timelock while there are other queued governance proposals.
+     */
+    // ！！！注意：当有其他排队等待执行的治理提案时，不建议更改时间锁实例。
+    // 这是因为更改时间锁可能导致治理提案与时间锁操作之间的不一致。
+    function updateTimelock(TimelockController newTimelock) external virtual onlyGovernance {
+        _updateTimelock(newTimelock);
+    }
+
+    function _updateTimelock(TimelockController newTimelock) private {
+        emit TimelockChange(address(_timelock), address(newTimelock));
+        _timelock = newTimelock;
+    }
+}
+
+```
